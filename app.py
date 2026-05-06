@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
+import psycopg2
 import hashlib
 import os
 import calendar
@@ -82,10 +82,72 @@ CATEGORY_ICONS = {
 
 
 # ============================================================
-# 資料庫
+# 資料庫：Supabase PostgreSQL
 # ============================================================
+
+# 保留這個名稱只是避免後面資料管理區塊引用 DB_FILE 時出錯。
+# 這一版實際資料庫已經改用 Supabase，不再使用本機 .db 檔案。
+DB_FILE = "Supabase PostgreSQL"
+
+
+class PgCursorWrapper:
+    """
+    讓原本 SQLite 的 ? placeholder 可以繼續使用。
+    PostgreSQL / psycopg2 原本需要 %s，這裡自動轉換。
+    這樣就不用把整份程式所有 SQL 都重寫。
+    """
+    def __init__(self, cursor):
+        self.cursor = cursor
+
+    def execute(self, query, params=None):
+        query = query.replace("?", "%s")
+        return self.cursor.execute(query, params or ())
+
+    def fetchone(self):
+        return self.cursor.fetchone()
+
+    def fetchall(self):
+        return self.cursor.fetchall()
+
+    def close(self):
+        return self.cursor.close()
+
+    @property
+    def description(self):
+        return self.cursor.description
+
+    def __iter__(self):
+        return iter(self.cursor)
+
+
+class PgConnectionWrapper:
+    """
+    包裝 psycopg2 connection，讓 pandas.read_sql_query
+    和原本 conn.cursor() / conn.commit() / conn.close() 的寫法可繼續使用。
+    """
+    def __init__(self, connection):
+        self.connection = connection
+
+    def cursor(self):
+        return PgCursorWrapper(self.connection.cursor())
+
+    def commit(self):
+        return self.connection.commit()
+
+    def rollback(self):
+        return self.connection.rollback()
+
+    def close(self):
+        return self.connection.close()
+
+
 def get_connection():
-    return sqlite3.connect(DB_FILE)
+    if "SUPABASE_DB_URL" not in st.secrets:
+        st.error("找不到 SUPABASE_DB_URL，請到 Streamlit Cloud 的 Secrets 設定 Supabase 連線字串。")
+        st.stop()
+
+    conn = psycopg2.connect(st.secrets["SUPABASE_DB_URL"])
+    return PgConnectionWrapper(conn)
 
 
 def init_db():
@@ -94,7 +156,7 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             salt TEXT NOT NULL,
             password_hash TEXT NOT NULL,
@@ -104,36 +166,36 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             date TEXT NOT NULL,
             type TEXT NOT NULL,
             title TEXT NOT NULL,
             category TEXT NOT NULL,
             account TEXT NOT NULL,
-            amount REAL NOT NULL,
+            amount NUMERIC NOT NULL,
             note TEXT
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS budgets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             month TEXT NOT NULL,
-            budget REAL NOT NULL,
+            budget NUMERIC NOT NULL,
             UNIQUE(user_id, month)
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS recurring_expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             title TEXT NOT NULL,
             category TEXT NOT NULL,
             account TEXT NOT NULL,
-            amount REAL NOT NULL,
+            amount NUMERIC NOT NULL,
             day INTEGER NOT NULL,
             note TEXT
         )
@@ -141,18 +203,18 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS account_balances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             account TEXT NOT NULL,
-            initial_balance REAL NOT NULL,
+            initial_balance NUMERIC NOT NULL,
             UNIQUE(user_id, account)
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS credit_cards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             card_name TEXT NOT NULL,
             closing_day INTEGER NOT NULL,
             payment_day INTEGER NOT NULL,
@@ -162,8 +224,8 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS category_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             keyword TEXT NOT NULL,
             transaction_type TEXT NOT NULL,
             category TEXT NOT NULL,
@@ -173,8 +235,8 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS saved_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             type TEXT NOT NULL,
             title TEXT NOT NULL,
             category TEXT NOT NULL,
@@ -222,7 +284,7 @@ def create_user(username, password):
 
         conn.commit()
         return True, "帳號建立成功"
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, "帳號已存在"
     finally:
         conn.close()
@@ -771,7 +833,7 @@ def match_category_rule(user_id, title, transaction_type):
 # 頁首
 # ============================================================
 st.title("💰 我的記帳 App")
-st.caption("Python + Streamlit + SQLite 製作的個人記帳工具")
+st.caption("Python + Streamlit + Supabase 製作的個人記帳工具")
 
 top_col1, top_col2 = st.columns([4, 1])
 
@@ -1658,38 +1720,15 @@ with tab12:
 
     st.divider()
 
-    st.write("### SQLite 資料庫備份")
-
-    if Path(DB_FILE).exists():
-        with open(DB_FILE, "rb") as f:
-            st.download_button(
-                label="下載完整資料庫備份",
-                data=f,
-                file_name=DB_FILE,
-                mime="application/octet-stream",
-                use_container_width=True
-            )
-
     st.divider()
 
-    st.write("### 還原 SQLite 資料庫")
+    st.write("### Supabase 資料備份說明")
 
-    st.warning("還原資料庫會覆蓋目前所有資料，建議先下載備份。")
-
-    uploaded_db = st.file_uploader("選擇 SQLite 備份檔", type=["db"], key="restore_db")
-
-    confirm_restore = st.checkbox("我確認要還原資料庫並覆蓋目前資料")
-
-    if uploaded_db is not None and st.button("還原資料庫"):
-        if confirm_restore:
-            with open(DB_FILE, "wb") as f:
-                f.write(uploaded_db.getbuffer())
-
-            st.success("資料庫已還原，請重新整理頁面並重新登入。")
-            st.session_state.clear()
-            st.rerun()
-        else:
-            st.error("請先勾選確認還原")
+    st.info(
+        "目前資料已儲存在 Supabase 雲端資料庫。"
+        "若要備份交易資料，請使用上方的「下載交易 CSV」。"
+        "若要完整備份整個資料庫，可到 Supabase Dashboard 匯出資料。"
+    )
 
     st.divider()
 
