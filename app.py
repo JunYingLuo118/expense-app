@@ -7,7 +7,13 @@ import calendar
 import matplotlib.pyplot as plt
 from datetime import date, datetime, timedelta
 from pathlib import Path
-
+ok, err = test_db_connection()
+if ok:
+    st.success("✅ Supabase 連線成功")
+else:
+    st.error("❌ Supabase 連線失敗")
+    st.code(err)
+    st.stop()
 # ============================================================
 # 基本設定
 # ============================================================
@@ -150,8 +156,22 @@ def get_connection():
     return PgConnectionWrapper(conn)
 
 
-def init_db():
+#def init_db():
     conn = get_connection()
+    def test_db_connection():
+    try:
+        conn = psycopg2.connect(
+            st.secrets["SUPABASE_DB_URL"],
+            connect_timeout=5
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT 1;")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return True, None
+    except Exception as e:
+        return False, str(e)
     cursor = conn.cursor()
 
     cursor.execute("""
